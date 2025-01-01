@@ -5,9 +5,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"golang.org/x/term"
 )
 
 const _stacheDir = ".stache"
@@ -30,40 +30,86 @@ const (
 	Background    = "255" // Off-white for backgrounds
 )
 
-type choice struct {
-	selected bool
-	label    string
-	path     string
+type model struct {
+	availableTable table.Model
+	managedTable   table.Model
+	activeTable    int // 0 for available, 1 for managed
+	width          int
+	height         int
 }
 
-type model struct {
-	choices      []choice
-	selected     map[int]choice
-	cursor       int
-	activeColumn int // 0 for left, 1 for right
-	leftScroll   int // track scroll position for left column
-	rightScroll  int // track scroll position for right column
-	width        int // terminal width
-	height       int // terminal height
+func getManagedStyles() table.Styles {
+	managedStyle := table.DefaultStyles()
+
+	managedStyle.Header = managedStyle.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color(PastelGreen)).
+		BorderBottom(true).
+		Bold(false)
+
+	managedStyle.Selected = managedStyle.Selected.
+		Foreground(lipgloss.Color(PastelYellow)).
+		Background(lipgloss.Color("57")).
+		Bold(false)
+
+	return managedStyle
+}
+
+func getAvailableStyles() table.Styles {
+	availableStyle := table.DefaultStyles()
+
+	availableStyle.Header = availableStyle.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color(PastelRed)).
+		BorderBottom(true).
+		Bold(false)
+
+	availableStyle.Selected = availableStyle.Selected.
+		Foreground(lipgloss.Color(PastelYellow)).
+		Background(lipgloss.Color("57")).
+		Bold(false)
+
+	return availableStyle
 }
 
 func newModel(dotfiles []string) *model {
-	fileNames := make([]choice, len(dotfiles))
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Println("Error getting home directory")
-	}
-	for i, file := range dotfiles {
-		prefix := fmt.Sprintf("%s/", homeDir)
-		fileNames[i] = choice{
-			selected: false,
-			label:    strings.TrimPrefix(file, prefix),
-			path:     fmt.Sprintf("%s/%s", homeDir, file),
-		}
+	columns := []table.Column{
+		{Title: "File", Width: 30},
 	}
 
+	availableRows := make([]table.Row, 0)
+	managedRows := make([]table.Row, 0)
+
+	homeDir, _ := os.UserHomeDir()
+	for _, file := range dotfiles {
+		prefix := fmt.Sprintf("%s/", homeDir)
+		label := strings.TrimPrefix(file, prefix)
+		availableRows = append(availableRows, table.Row{label})
+	}
+
+	managedStyle := getManagedStyles()
+	availableStyle := getAvailableStyles()
+
+	availableTable := table.New(
+		table.WithColumns(columns),
+		table.WithRows(availableRows),
+		table.WithFocused(true),
+		table.WithHeight(10),
+	)
+	availableTable.SetStyles(availableStyle)
+
+	managedTable := table.New(
+		table.WithColumns(columns),
+		table.WithRows(managedRows),
+		table.WithFocused(false),
+		table.WithHeight(10),
+	)
+	managedTable.SetStyles(managedStyle)
+
 	return &model{
-		choices: fileNames,
+		availableTable: availableTable,
+		managedTable:   managedTable,
+		activeTable:    0,
 	}
 }
 
@@ -71,224 +117,126 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
-func (m *model) getVisibleItems() (unmanaged, managed []choice) {
-	for _, item := range m.choices {
-		if item.selected {
-			managed = append(managed, item)
-		} else {
-			unmanaged = append(unmanaged, item)
-		}
+func moveItemBetweenTables(fromTable, toTable *table.Model) {
+	if len(fromTable.Rows()) == 0 {
+		return
 	}
-	return unmanaged, managed
+
+	cursor := fromTable.Cursor()
+	selectedRow := fromTable.SelectedRow()
+
+	newToRows := append(toTable.Rows(), selectedRow)
+	toTable.SetRows(newToRows)
+
+	fromRows := fromTable.Rows()
+	newFromRows := append(fromRows[:cursor], fromRows[cursor+1:]...)
+	fromTable.SetRows(newFromRows)
+
+	if len(newFromRows) == 0 {
+		fromTable.SetCursor(0)
+	} else if cursor >= len(newFromRows) {
+		fromTable.SetCursor(len(newFromRows) - 1)
+	} else {
+		fromTable.SetCursor(cursor)
+	}
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+		tableHeight := m.height - 8
+		m.availableTable.SetHeight(tableHeight)
+		m.managedTable.SetHeight(tableHeight)
+
+		columnWidth := (m.width / 2) - 6
+		m.availableTable.SetColumns([]table.Column{
+			{Title: "Available Files", Width: columnWidth},
+		})
+		m.managedTable.SetColumns([]table.Column{
+			{Title: "Managed by Stache", Width: columnWidth},
+		})
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "tab":
+			m.activeTable = (m.activeTable + 1) % 2
+			if m.activeTable == 0 {
+				m.availableTable.Focus()
+				m.managedTable.Blur()
+			} else {
+				m.availableTable.Blur()
+				m.managedTable.Focus()
+			}
+			return m, nil
+
+		case "enter", " ":
+			if m.activeTable == 0 {
+				moveItemBetweenTables(&m.availableTable, &m.managedTable)
+			} else {
+				moveItemBetweenTables(&m.managedTable, &m.availableTable)
+			}
+
+		case "q", "ctrl+c":
+			return m, tea.Quit
+
+		case "x":
+			m.dryRunSymLink()
+		default:
+			if m.activeTable == 0 {
+				m.availableTable, cmd = m.availableTable.Update(msg)
+			} else {
+				m.managedTable, cmd = m.managedTable.Update(msg)
+			}
+
+		}
+
+	}
+
+	return m, cmd
 }
 
 func (m model) dryRunSymLink() {
-	// Create a temporary directory
-	// Create a symlink in the temporary directory
-	// Check if the symlink is valid
-	// Return the result
-
 	userHomeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Println("Error getting home directory")
 		os.Exit(1)
 	}
 	stacheHomeDir := fmt.Sprintf("%s/%s", userHomeDir, _stacheDir)
-	for _, choice := range m.choices {
-		if choice.selected {
-			fmt.Println("Symlinking to stache directory")
-			fmt.Printf("Linking %s to %s\n", choice.path, stacheHomeDir)
-			fmt.Printf("Final location: %s/%s\n", stacheHomeDir, choice.label)
-		}
+
+	for _, row := range m.managedTable.Rows() {
+		filename := row[0]
+		fmt.Printf("Would symlink %s/%s to %s/%s\n", userHomeDir, filename, stacheHomeDir, filename)
 	}
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "x":
-			m.dryRunSymLink()
-
-		case "ctrl+c", "q":
-			return m, tea.Quit
-
-		case "tab":
-			m.activeColumn = (m.activeColumn + 1) % 2
-			m.cursor = 0
-			m.leftScroll = 0
-			m.rightScroll = 0
-
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-				if m.activeColumn == 0 && m.cursor < m.leftScroll {
-					m.leftScroll = m.cursor
-				} else if m.activeColumn == 1 && m.cursor < m.rightScroll {
-					m.rightScroll = m.cursor
-				}
-			}
-
-		case "down", "j":
-			unmanaged, managed := m.getVisibleItems()
-			currentLen := len(unmanaged)
-			if m.activeColumn == 1 {
-				currentLen = len(managed)
-			}
-
-			if m.cursor < currentLen-1 {
-				m.cursor++
-				contentHeight := m.height - 4
-				if m.activeColumn == 0 && m.cursor >= m.leftScroll+contentHeight {
-					m.leftScroll = m.cursor - contentHeight + 1
-				} else if m.activeColumn == 1 && m.cursor >= m.rightScroll+contentHeight {
-					m.rightScroll = m.cursor - contentHeight + 1
-				}
-			}
-
-		case "enter", " ":
-			unmanaged, managed := m.getVisibleItems()
-			if m.activeColumn == 0 && m.cursor < len(unmanaged) {
-				currentIndex := -1
-				count := 0
-				for i, choice := range m.choices {
-					if !choice.selected {
-						if count == m.cursor {
-							currentIndex = i
-							break
-						}
-						count++
-					}
-				}
-				if currentIndex != -1 {
-					m.choices[currentIndex].selected = true
-				}
-			} else if m.activeColumn == 1 && m.cursor < len(managed) {
-				// Find the actual index in the original choices slice
-				currentIndex := -1
-				count := 0
-				for i, choice := range m.choices {
-					if choice.selected {
-						if count == m.cursor {
-							currentIndex = i
-							break
-						}
-						count++
-					}
-				}
-				if currentIndex != -1 {
-					m.choices[currentIndex].selected = false
-				}
-			}
-			// Reset cursor if it would be out of bounds
-			unmanaged, managed = m.getVisibleItems()
-			if m.activeColumn == 0 && m.cursor >= len(unmanaged) {
-				m.cursor = len(unmanaged) - 1
-				if m.cursor < 0 {
-					m.cursor = 0
-				}
-			} else if m.activeColumn == 1 && m.cursor >= len(managed) {
-				m.cursor = len(managed) - 1
-				if m.cursor < 0 {
-					m.cursor = 0
-				}
-			}
-		}
-
-	case tea.WindowSizeMsg:
-		m.height = msg.Height
-		m.width = msg.Width
-	}
-
-	return m, nil
 }
 
 func (m model) View() string {
-	w, h, err := term.GetSize(0)
-	if err != nil {
-		fmt.Println("Error getting terminal size")
-		os.Exit(1)
+	tableStyle := lipgloss.NewStyle().
+		BorderStyle(lipgloss.NormalBorder()).
+		Padding(0, 1)
+
+	if m.activeTable == 0 {
+		tableStyle = tableStyle.BorderForeground(lipgloss.Color("86"))
+	} else {
+		tableStyle = tableStyle.BorderForeground(lipgloss.Color("240"))
 	}
-	contentHeight := h - 10
+	leftTable := tableStyle.Render(m.availableTable.View())
 
-	leftColumn := lipgloss.NewStyle().
-		Width(w/2 - 2).
-		Height(contentHeight).
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("240"))
-
-	if m.activeColumn == 0 {
-		leftColumn = leftColumn.BorderForeground(lipgloss.Color(PastelGreen))
+	if m.activeTable == 1 {
+		tableStyle = tableStyle.BorderForeground(lipgloss.Color("86"))
+	} else {
+		tableStyle = tableStyle.BorderForeground(lipgloss.Color("240"))
 	}
+	rightTable := tableStyle.Render(m.managedTable.View())
 
-	rightColumn := lipgloss.NewStyle().
-		Width(w/2 - 2).
-		Height(contentHeight).
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("240"))
+	tables := lipgloss.JoinHorizontal(lipgloss.Top, leftTable, rightTable)
+	help := "\nPress tab to switch tables, space/enter to move items, x to save, q to quit"
 
-	if m.activeColumn == 1 {
-		rightColumn = rightColumn.BorderForeground(lipgloss.Color(PastelGreen))
-	}
-
-	leftContent := "Unmanaged Files:\n\n"
-	rightContent := "Managed Files:\n\n"
-
-	unmanaged, managed := m.getVisibleItems()
-
-	// Build unmanaged files list
-	unmanagedStrings := make([]string, len(unmanaged))
-	for i, choice := range unmanaged {
-		cursor := " "
-		if m.activeColumn == 0 && m.cursor == i {
-			cursor = ">"
-		}
-		normalStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-		renderedLabel := normalStyle.Render(choice.label)
-		unmanagedStrings[i] = fmt.Sprintf("%s %s", cursor, renderedLabel)
-	}
-
-	// Build managed files list
-	managedStrings := make([]string, len(managed))
-	for i, choice := range managed {
-		cursor := " "
-		if m.activeColumn == 1 && m.cursor == i {
-			cursor = ">"
-		}
-		selectedStyle := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color(PastelGreen))
-		renderedLabel := selectedStyle.Render(choice.label)
-		managedStrings[i] = fmt.Sprintf("%s %s", cursor, renderedLabel)
-	}
-
-	// Apply scrolling
-	if len(unmanagedStrings) > contentHeight {
-		end := m.leftScroll + contentHeight
-		if end > len(unmanagedStrings) {
-			end = len(unmanagedStrings)
-		}
-		unmanagedStrings = unmanagedStrings[m.leftScroll:end]
-	}
-
-	if len(managedStrings) > contentHeight {
-		end := m.rightScroll + contentHeight
-		if end > len(managedStrings) {
-			end = len(managedStrings)
-		}
-		managedStrings = managedStrings[m.rightScroll:end]
-	}
-
-	leftContent += strings.Join(unmanagedStrings, "\n")
-	rightContent += strings.Join(managedStrings, "\n")
-
-	columns := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		leftColumn.Render(leftContent),
-		rightColumn.Render(rightContent),
-	)
-
-	return columns + "\n\nPress q to quit, Tab to switch columns, Space to select, x to save\n"
+	return tables + help
 }
 
 func loadDotFiles() []string {
@@ -315,10 +263,9 @@ func loadDotFiles() []string {
 
 func main() {
 	files := loadDotFiles()
-	p := tea.NewProgram(newModel(files))
+	p := tea.NewProgram(newModel(files), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Something went wrong!")
+		fmt.Printf("Error running program: %v", err)
 		os.Exit(1)
 	}
-	println("Hello, World!")
 }
